@@ -1,8 +1,9 @@
 """Segment a video with text prompts and save the segmentation overlaid on the video.
 
   python scripts/segment_video.py --video clip --prompts gravel grass tree --threshold 0.3
+  python scripts/segment_video.py --video clip --prompts gravel grass tree --model sam3.1
 
-Output: outputs/segment_video/<video>_overlay.mp4   colored masks + legend (+ track ids)
+Output: outputs/segment_video/<video>_<model>_overlay.mp4   colored masks + legend (+ track ids)
         outputs/segment_video/<video>_tracks.json   per prompt: track id -> number of frames seen
         outputs/segment_video/<video>_labels.npz    (only with --save-masks) per-frame label map
 SAM 3 allows one text prompt per video session, so each prompt is propagated separately
@@ -29,6 +30,12 @@ ap.add_argument("--no-ids", action="store_true", help="do not draw track ids")
 ap.add_argument("--save-masks", action="store_true")
 ap.add_argument("--seconds", type=float, default=0, help="only use this many seconds of video (0 = all)")
 ap.add_argument("--start", type=float, default=0, help="start time in seconds (used with --seconds)")
+ap.add_argument("--model", choices=["sam3", "sam3.1"], default="sam3",
+                help="sam3 = facebook/sam3 (Nov 2025); sam3.1 = facebook/sam3.1 with Object Multiplex (Mar 2026)")
+ap.add_argument("--max-objects", type=int, default=16,
+                help="sam3.1 only: max tracked objects per prompt (16 = SAM 3.1 default)")
+ap.add_argument("--fa3", action="store_true",
+                help="sam3.1 only: use FlashAttention-3 (needs flash-attn-3 installed; off by default)")
 ap.add_argument("--max-frames", type=int, default=0, help="use only the first N frames (0 = all)")
 ap.add_argument("--stride", type=int, default=1, help="use every k-th frame (fps is divided accordingly)")
 ap.add_argument("--interval-ms", type=float, default=0,
@@ -93,7 +100,15 @@ best = np.zeros((T, H, W), np.uint8)
 ids_per_frame = [collections.defaultdict(list) for _ in range(T)]   # frame -> prompt idx -> [(id, cx, cy)]
 lifetimes = {q: collections.Counter() for q in a.prompts}
 
-predictor = build_sam3_video_predictor(gpus_to_use=[torch.cuda.current_device()])
+t_start = time.time()
+if a.model == "sam3.1":
+    from sam3.model_builder import build_sam3_multiplex_video_predictor
+    # checkpoint=None -> downloads facebook/sam3.1 (needs HF access to that repo)
+    predictor = build_sam3_multiplex_video_predictor(max_num_objects=a.max_objects, use_fa3=a.fa3)
+else:
+    predictor = build_sam3_video_predictor(gpus_to_use=[torch.cuda.current_device()])
+print(f"model: {a.model}, loaded in {time.time() - t_start:.1f}s")
+t_run = time.time()
 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
     sid = predictor.handle_request(dict(
         type="start_session", resource_path=path,
@@ -127,6 +142,7 @@ with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 n_obj.add(int(oid))
         print(f"{q:20s} tracks={len(n_obj)} time={time.time() - t0:.1f}s")
     predictor.handle_request(dict(type="close_session", session_id=sid))
+t_infer = time.time() - t_run
 
 # --- render ---
 palette = [(230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200), (245, 130, 48),
@@ -135,7 +151,7 @@ colors = np.array([palette[i % len(palette)] for i in range(len(a.prompts))])
 
 fourcc_ok = False
 for cc in ("avc1", "mp4v"):          # avc1 plays in browsers; mp4v is the fallback
-    vw = cv2.VideoWriter(f"{a.out}/{name}_overlay.mp4", cv2.VideoWriter_fourcc(*cc), fps, (W, H))
+    vw = cv2.VideoWriter(f"{a.out}/{name}_{a.model}_overlay.mp4", cv2.VideoWriter_fourcc(*cc), fps, (W, H))
     if vw.isOpened():
         fourcc_ok = True
         break
@@ -165,8 +181,9 @@ for t in range(T):
 vw.release()
 
 json.dump({q: {str(k): v for k, v in c.items()} for q, c in lifetimes.items()},
-          open(f"{a.out}/{name}_tracks.json", "w"), indent=1)
+          open(f"{a.out}/{name}_{a.model}_tracks.json", "w"), indent=1)
 if a.save_masks:
-    np.savez_compressed(f"{a.out}/{name}_labels.npz", prompts=np.array(a.prompts), labels=lab, scores=best)
+    np.savez_compressed(f"{a.out}/{name}_{a.model}_labels.npz", prompts=np.array(a.prompts), labels=lab, scores=best)
+print(f"inference time (all prompts): {t_infer:.1f}s for {T} frames ({t_infer / T:.2f}s/frame)")
 print(f"peak GPU memory: {torch.cuda.max_memory_allocated() / 1024**3:.1f} GB")
-print(f"saved {a.out}/{name}_overlay.mp4, {name}_tracks.json" + (f", {name}_labels.npz" if a.save_masks else ""))
+print(f"saved {a.out}/{name}_{a.model}_overlay.mp4, {name}_{a.model}_tracks.json" + (f", {name}_{a.model}_labels.npz" if a.save_masks else ""))
