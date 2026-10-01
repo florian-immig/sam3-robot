@@ -105,6 +105,22 @@ if a.model == "sam3.1":
     from sam3.model_builder import build_sam3_multiplex_video_predictor
     # checkpoint=None -> downloads facebook/sam3.1 (needs HF access to that repo)
     predictor = build_sam3_multiplex_video_predictor(max_num_objects=a.max_objects, use_fa3=a.fa3)
+
+    # Workaround for a bug in the SAM 3 repo: Sam3BasePredictor.start_session always passes
+    # offload_state_to_cpu (and maybe video_loader_type) to model.init_state, but the 3.1
+    # multiplex model's init_state does not accept them. Drop any kwargs it can't take.
+    import functools, inspect
+    _orig_init = predictor.model.init_state
+    _ok = set(inspect.signature(_orig_init).parameters)
+
+    @functools.wraps(_orig_init)
+    def _init_state(*args, **kw):
+        dropped = [k for k in kw if k not in _ok]
+        if dropped:
+            print(f"[sam3.1] init_state does not support {dropped}; ignoring")
+        return _orig_init(*args, **{k: v for k, v in kw.items() if k in _ok})
+
+    predictor.model.init_state = _init_state
 else:
     predictor = build_sam3_video_predictor(gpus_to_use=[torch.cuda.current_device()])
 print(f"model: {a.model}, loaded in {time.time() - t_start:.1f}s")
