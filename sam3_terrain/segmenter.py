@@ -7,6 +7,7 @@ session, so we run one session per concept and merge the per-frame outputs.
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch
 from PIL import Image
 
 from .concepts import CONCEPTS, Concept
@@ -38,7 +39,13 @@ class ConceptSegmenter:
             build_sam3_image_model(), device=device, confidence_threshold=threshold
         )
 
+    @torch.inference_mode()
     def segment_image(self, image: Image.Image) -> list[Detections]:
+        # SAM 3 mixes bf16/fp32 internally; its own examples run under bf16 autocast
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return self._segment_image(image)
+
+    def _segment_image(self, image: Image.Image) -> list[Detections]:
         state = self.processor.set_image(image)
         w, h = image.size
         out = []

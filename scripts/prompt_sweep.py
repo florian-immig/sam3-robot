@@ -4,6 +4,7 @@ _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
 
 import argparse, glob
 
+import torch
 from PIL import Image
 
 from sam3.model_builder import build_sam3_image_model
@@ -14,6 +15,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--images", default="data/images/*.jpg")
 a = ap.parse_args()
 
+torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+torch.inference_mode().__enter__()
 proc = Sam3Processor(build_sam3_image_model(), confidence_threshold=0.3)
 for p in sorted(glob.glob(a.images)):
     state = proc.set_image(Image.open(p).convert("RGB"))
