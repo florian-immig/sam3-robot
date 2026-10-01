@@ -34,6 +34,12 @@ ap.add_argument("--model", choices=["sam3", "sam3.1"], default="sam3",
                 help="sam3 = facebook/sam3 (Nov 2025); sam3.1 = facebook/sam3.1 with Object Multiplex (Mar 2026)")
 ap.add_argument("--max-objects", type=int, default=16,
                 help="sam3.1 only: max tracked objects per prompt (16 = SAM 3.1 default)")
+ap.add_argument("--grounding-batch", type=int, default=16,
+                help="sam3.1 only: frames the detector processes at once (16 = default; lower = less GPU memory)")
+ap.add_argument("--postprocess-batch", type=int, default=16,
+                help="sam3.1 only: frames whose masks are post-processed together at full video "
+                     "resolution (16 = default; lower = less GPU memory)")
+ap.add_argument("--log-memory", action="store_true", help="print GPU memory after every frame")
 ap.add_argument("--fa3", action="store_true",
                 help="sam3.1 only: use FlashAttention-3 (needs flash-attn-3 installed; off by default)")
 ap.add_argument("--max-frames", type=int, default=0, help="use only the first N frames (0 = all)")
@@ -121,6 +127,15 @@ if a.model == "sam3.1":
         return _orig_init(*args, **{k: v for k, v in kw.items() if k in _ok})
 
     predictor.model.init_state = _init_state
+
+    # SAM 3.1 hardcodes 16 for both batch sizes; they are plain attributes, so they can be lowered.
+    m = predictor.model
+    if a.grounding_batch != m.batched_grounding_batch_size:
+        m.batched_grounding_batch_size = max(a.grounding_batch, 1)
+    if a.postprocess_batch != m.postprocess_batch_size:
+        m.postprocess_batch_size = max(a.postprocess_batch, 1)
+    print(f"[sam3.1] grounding batch={m.batched_grounding_batch_size}, "
+          f"postprocess batch={m.postprocess_batch_size}, max objects={a.max_objects}")
 else:
     predictor = build_sam3_video_predictor(gpus_to_use=[torch.cuda.current_device()])
 print(f"model: {a.model}, loaded in {time.time() - t_start:.1f}s")
@@ -136,8 +151,29 @@ with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         predictor.handle_request(dict(type="add_prompt", session_id=sid,
                                       frame_index=a.prompt_frame, text=q))
         n_obj = set()
-        for r in predictor.handle_stream_request(dict(type="propagate_in_video", session_id=sid)):
+        def _gb(x):
+            return f"{x / 1024**3:.1f}GB"
+
+        stream = predictor.handle_stream_request(dict(type="propagate_in_video", session_id=sid))
+        while True:
+            try:
+                r = next(stream)
+            except StopIteration:
+                break
+            except RuntimeError as e:
+                free, total = torch.cuda.mem_get_info()
+                print(f"\nFAILED during propagation: {str(e)[:120]}")
+                print(f"GPU memory: allocated={_gb(torch.cuda.memory_allocated())} "
+                      f"peak={_gb(torch.cuda.max_memory_allocated())} "
+                      f"reserved={_gb(torch.cuda.memory_reserved())} "
+                      f"free={_gb(free)} of {_gb(total)}")
+                print("If peak is close to the total, this is GPU out-of-memory: lower "
+                      "--grounding-batch / --postprocess-batch / --max-objects, or use --max-side.")
+                raise
             fi, o = r["frame_index"], r["outputs"]
+            if a.log_memory:
+                print(f"frame {fi}: allocated={_gb(torch.cuda.memory_allocated())} "
+                      f"peak={_gb(torch.cuda.max_memory_allocated())}")
             if fi >= T:
                 continue
             masks = np.asarray(o["out_binary_masks"]).astype(bool)
