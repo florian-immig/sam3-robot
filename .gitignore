@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+outputs/*
+!outputs/.gitkeep
+data/images/*
+data/videos/*
+!data/images/.gitkeep
+!data/videos/.gitkeep
+third_party/
+.venv/
