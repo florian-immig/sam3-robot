@@ -27,6 +27,8 @@ ap.add_argument("--alpha", type=float, default=0.5)
 ap.add_argument("--prompt-frame", type=int, default=0, help="frame where the text prompt is added")
 ap.add_argument("--no-ids", action="store_true", help="do not draw track ids")
 ap.add_argument("--save-masks", action="store_true")
+ap.add_argument("--seconds", type=float, default=0, help="only use this many seconds of video (0 = all)")
+ap.add_argument("--start", type=float, default=0, help="start time in seconds (used with --seconds)")
 ap.add_argument("--max-frames", type=int, default=0, help="use only the first N frames (0 = all)")
 ap.add_argument("--stride", type=int, default=1, help="use every k-th frame (fps is divided accordingly)")
 ap.add_argument("--interval-ms", type=float, default=0,
@@ -54,6 +56,12 @@ while True:
         break
     frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
 cap.release()
+n_file = len(frames)                                        # frames in the file on disk
+lo = int(round(a.start * fps))
+hi = lo + int(round(a.seconds * fps)) if a.seconds else n_file
+frames = frames[lo:hi]
+if not frames:
+    raise SystemExit(f"no frames left: clip has {n_file} frames ({n_file / fps:.1f}s), start={a.start}s")
 n_orig = len(frames)
 if a.interval_ms:
     step = a.interval_ms / 1000 * fps                       # source frames per kept frame
@@ -69,8 +77,8 @@ if a.max_side and max(frames[0].shape[:2]) > a.max_side:
     k = a.max_side / max(frames[0].shape[:2])
     frames = [cv2.resize(f, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) for f in frames]
 T, (H, W) = len(frames), frames[0].shape[:2]
-print(f"{path}: using {T}/{n_orig} frames, {W}x{H}, {fps:.1f} fps")
-if T != n_orig or (W, H) != (int(cv2.VideoCapture(path).get(3)), int(cv2.VideoCapture(path).get(4))):
+print(f"{path}: using {T}/{n_file} frames, {W}x{H}, {fps:.1f} fps")
+if T != n_file or (W, H) != (int(cv2.VideoCapture(path).get(3)), int(cv2.VideoCapture(path).get(4))):
     # the model reads a file, so write the trimmed/downscaled clip to a temp file
     path = f"{a.out}/_tmp_{name}.mp4"
     tw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
