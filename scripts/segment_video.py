@@ -27,6 +27,11 @@ ap.add_argument("--alpha", type=float, default=0.5)
 ap.add_argument("--prompt-frame", type=int, default=0, help="frame where the text prompt is added")
 ap.add_argument("--no-ids", action="store_true", help="do not draw track ids")
 ap.add_argument("--save-masks", action="store_true")
+ap.add_argument("--max-frames", type=int, default=0, help="use only the first N frames (0 = all)")
+ap.add_argument("--stride", type=int, default=1, help="use every k-th frame (fps is divided accordingly)")
+ap.add_argument("--max-side", type=int, default=0, help="downscale so the longer side is at most this (0 = keep)")
+ap.add_argument("--no-offload", action="store_true",
+                help="keep frames and tracking state on the GPU (faster, but uses much more GPU memory)")
 ap.add_argument("--out", default="outputs/segment_video")
 a = ap.parse_args()
 
@@ -47,8 +52,24 @@ while True:
         break
     frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
 cap.release()
+n_orig = len(frames)
+frames = frames[::max(a.stride, 1)]
+if a.max_frames:
+    frames = frames[:a.max_frames]
+if a.max_side and max(frames[0].shape[:2]) > a.max_side:
+    k = a.max_side / max(frames[0].shape[:2])
+    frames = [cv2.resize(f, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) for f in frames]
+fps = fps / max(a.stride, 1)
 T, (H, W) = len(frames), frames[0].shape[:2]
-print(f"{path}: {T} frames, {W}x{H}, {fps:.1f} fps")
+print(f"{path}: using {T}/{n_orig} frames, {W}x{H}, {fps:.1f} fps")
+if T != n_orig or (W, H) != (int(cv2.VideoCapture(path).get(3)), int(cv2.VideoCapture(path).get(4))):
+    # the model reads a file, so write the trimmed/downscaled clip to a temp file
+    path = f"{a.out}/_tmp_{name}.mp4"
+    tw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    for f in frames:
+        tw.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+    tw.release()
+    print(f"wrote temporary clip {path}")
 
 # running per-pixel winner across prompts: label index + score (uint8 = score*255)
 lab = np.full((T, H, W), -1, np.int8)
@@ -58,7 +79,10 @@ lifetimes = {q: collections.Counter() for q in a.prompts}
 
 predictor = build_sam3_video_predictor(gpus_to_use=[torch.cuda.current_device()])
 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-    sid = predictor.handle_request(dict(type="start_session", resource_path=path))["session_id"]
+    sid = predictor.handle_request(dict(
+        type="start_session", resource_path=path,
+        offload_video_to_cpu=not a.no_offload,
+        offload_state_to_cpu=not a.no_offload))["session_id"]
     for pi, q in enumerate(a.prompts):
         t0 = time.time()
         predictor.handle_request(dict(type="reset_session", session_id=sid))
@@ -128,4 +152,5 @@ json.dump({q: {str(k): v for k, v in c.items()} for q, c in lifetimes.items()},
           open(f"{a.out}/{name}_tracks.json", "w"), indent=1)
 if a.save_masks:
     np.savez_compressed(f"{a.out}/{name}_labels.npz", prompts=np.array(a.prompts), labels=lab, scores=best)
+print(f"peak GPU memory: {torch.cuda.max_memory_allocated() / 1024**3:.1f} GB")
 print(f"saved {a.out}/{name}_overlay.mp4, {name}_tracks.json" + (f", {name}_labels.npz" if a.save_masks else ""))
