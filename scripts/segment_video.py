@@ -1,0 +1,131 @@
+"""Segment a video with text prompts and save the segmentation overlaid on the video.
+
+  python scripts/segment_video.py --video clip --prompts gravel grass tree --threshold 0.3
+
+Output: outputs/segment_video/<video>_overlay.mp4   colored masks + legend (+ track ids)
+        outputs/segment_video/<video>_tracks.json   per prompt: track id -> number of frames seen
+        outputs/segment_video/<video>_labels.npz    (only with --save-masks) per-frame label map
+SAM 3 allows one text prompt per video session, so each prompt is propagated separately
+and the results are merged; run time grows with the number of prompts.
+"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+
+import argparse, collections, json, os, time
+
+import cv2
+import numpy as np
+import torch
+
+from sam3.model_builder import build_sam3_video_predictor
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--video", required=True, help="file name in data/videos (extension optional) or a path")
+ap.add_argument("--prompts", nargs="+", required=True)
+ap.add_argument("--threshold", type=float, default=0.3, help="min per-instance score per frame")
+ap.add_argument("--alpha", type=float, default=0.5)
+ap.add_argument("--prompt-frame", type=int, default=0, help="frame where the text prompt is added")
+ap.add_argument("--no-ids", action="store_true", help="do not draw track ids")
+ap.add_argument("--save-masks", action="store_true")
+ap.add_argument("--out", default="outputs/segment_video")
+a = ap.parse_args()
+
+cands = [a.video, f"data/videos/{a.video}"] + [f"data/videos/{a.video}{e}" for e in (".mp4", ".mov", ".avi", ".mkv", ".MP4")]
+path = next((c for c in cands if os.path.isfile(c)), None)
+if path is None:
+    raise SystemExit(f"video not found: {a.video}")
+os.makedirs(a.out, exist_ok=True)
+name = os.path.splitext(os.path.basename(path))[0]
+
+# --- read frames (for the overlay only; the model reads the file itself) ---
+cap = cv2.VideoCapture(path)
+fps = cap.get(cv2.CAP_PROP_FPS) or 15
+frames = []
+while True:
+    ok, f = cap.read()
+    if not ok:
+        break
+    frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
+cap.release()
+T, (H, W) = len(frames), frames[0].shape[:2]
+print(f"{path}: {T} frames, {W}x{H}, {fps:.1f} fps")
+
+# running per-pixel winner across prompts: label index + score (uint8 = score*255)
+lab = np.full((T, H, W), -1, np.int8)
+best = np.zeros((T, H, W), np.uint8)
+ids_per_frame = [collections.defaultdict(list) for _ in range(T)]   # frame -> prompt idx -> [(id, cx, cy)]
+lifetimes = {q: collections.Counter() for q in a.prompts}
+
+predictor = build_sam3_video_predictor(gpus_to_use=[torch.cuda.current_device()])
+with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+    sid = predictor.handle_request(dict(type="start_session", resource_path=path))["session_id"]
+    for pi, q in enumerate(a.prompts):
+        t0 = time.time()
+        predictor.handle_request(dict(type="reset_session", session_id=sid))
+        predictor.handle_request(dict(type="add_prompt", session_id=sid,
+                                      frame_index=a.prompt_frame, text=q))
+        n_obj = set()
+        for r in predictor.handle_stream_request(dict(type="propagate_in_video", session_id=sid)):
+            fi, o = r["frame_index"], r["outputs"]
+            if fi >= T:
+                continue
+            masks = np.asarray(o["out_binary_masks"]).astype(bool)
+            probs = np.asarray(o["out_probs"], dtype=np.float32).reshape(-1)
+            oids = np.asarray(o["out_obj_ids"]).reshape(-1)
+            for m, p, oid in zip(masks, probs, oids):
+                if p < a.threshold or not m.any():
+                    continue
+                if m.shape != (H, W):
+                    m = cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
+                sc = np.uint8(min(p, 1.0) * 255)
+                upd = m & (sc > best[fi])
+                best[fi][upd] = sc
+                lab[fi][upd] = pi
+                ys, xs = np.nonzero(m)
+                ids_per_frame[fi][pi].append((int(oid), int(xs.mean()), int(ys.mean())))
+                lifetimes[q][int(oid)] += 1
+                n_obj.add(int(oid))
+        print(f"{q:20s} tracks={len(n_obj)} time={time.time() - t0:.1f}s")
+    predictor.handle_request(dict(type="close_session", session_id=sid))
+
+# --- render ---
+palette = [(230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200), (245, 130, 48),
+           (145, 30, 180), (70, 240, 240), (240, 50, 230), (210, 245, 60), (250, 190, 212)]
+colors = np.array([palette[i % len(palette)] for i in range(len(a.prompts))])
+
+fourcc_ok = False
+for cc in ("avc1", "mp4v"):          # avc1 plays in browsers; mp4v is the fallback
+    vw = cv2.VideoWriter(f"{a.out}/{name}_overlay.mp4", cv2.VideoWriter_fourcc(*cc), fps, (W, H))
+    if vw.isOpened():
+        fourcc_ok = True
+        break
+if not fourcc_ok:
+    raise SystemExit("could not open a video writer")
+
+for t in range(T):
+    out = frames[t].astype(np.float32)
+    for i in range(len(a.prompts)):
+        mk = lab[t] == i
+        if mk.any():
+            out[mk] = (1 - a.alpha) * out[mk] + a.alpha * colors[i]
+    out = np.ascontiguousarray(out.astype(np.uint8))
+    if not a.no_ids:
+        for pi, items in ids_per_frame[t].items():
+            for oid, cx, cy in items:
+                cv2.putText(out, str(oid), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+                cv2.putText(out, str(oid), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    for row, q in enumerate(a.prompts):
+        y = 8 + 24 * row
+        pct = (lab[t] == row).mean() * 100
+        cv2.rectangle(out, (8, y), (26, y + 16), tuple(int(c) for c in colors[row]), -1)
+        txt = f"{q} ({pct:.0f}%)"
+        cv2.putText(out, txt, (32, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+        cv2.putText(out, txt, (32, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    vw.write(cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
+vw.release()
+
+json.dump({q: {str(k): v for k, v in c.items()} for q, c in lifetimes.items()},
+          open(f"{a.out}/{name}_tracks.json", "w"), indent=1)
+if a.save_masks:
+    np.savez_compressed(f"{a.out}/{name}_labels.npz", prompts=np.array(a.prompts), labels=lab, scores=best)
+print(f"saved {a.out}/{name}_overlay.mp4, {name}_tracks.json" + (f", {name}_labels.npz" if a.save_masks else ""))
