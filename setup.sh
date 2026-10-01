@@ -6,4 +6,5 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
 git clone https://github.com/facebookresearch/sam3.git third_party/sam3
 pip install -e third_party/sam3
-pip install opencv-python pillow numpy matplotlib
+# sam3 pins numpy<2; constrain it so opencv does not pull numpy 2.x
+pip install "numpy<2" opencv-python-headless pillow matplotlib
