@@ -29,6 +29,8 @@ ap.add_argument("--no-ids", action="store_true", help="do not draw track ids")
 ap.add_argument("--save-masks", action="store_true")
 ap.add_argument("--max-frames", type=int, default=0, help="use only the first N frames (0 = all)")
 ap.add_argument("--stride", type=int, default=1, help="use every k-th frame (fps is divided accordingly)")
+ap.add_argument("--interval-ms", type=float, default=0,
+                help="keep one frame every N ms of video time, e.g. 100 (overrides --stride)")
 ap.add_argument("--max-side", type=int, default=0, help="downscale so the longer side is at most this (0 = keep)")
 ap.add_argument("--no-offload", action="store_true",
                 help="keep frames and tracking state on the GPU (faster, but uses much more GPU memory)")
@@ -53,13 +55,19 @@ while True:
     frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
 cap.release()
 n_orig = len(frames)
-frames = frames[::max(a.stride, 1)]
+if a.interval_ms:
+    step = a.interval_ms / 1000 * fps                       # source frames per kept frame
+    idx = sorted({min(int(round(k * step)), n_orig - 1) for k in range(int(n_orig / step) + 1)})
+    frames = [frames[i] for i in idx]
+    fps = 1000 / a.interval_ms                              # play back in real time
+else:
+    frames = frames[::max(a.stride, 1)]
+    fps = fps / max(a.stride, 1)
 if a.max_frames:
     frames = frames[:a.max_frames]
 if a.max_side and max(frames[0].shape[:2]) > a.max_side:
     k = a.max_side / max(frames[0].shape[:2])
     frames = [cv2.resize(f, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) for f in frames]
-fps = fps / max(a.stride, 1)
 T, (H, W) = len(frames), frames[0].shape[:2]
 print(f"{path}: using {T}/{n_orig} frames, {W}x{H}, {fps:.1f} fps")
 if T != n_orig or (W, H) != (int(cv2.VideoCapture(path).get(3)), int(cv2.VideoCapture(path).get(4))):
