@@ -1,4 +1,7 @@
 """Concept-style SAM 3 on video -> overlay mp4 + track stats (ID switches, lifetimes)."""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+
 import argparse, collections, json, os
 
 import cv2

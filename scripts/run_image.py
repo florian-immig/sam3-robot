@@ -1,4 +1,7 @@
 """Concept-style SAM 3 on still images -> overlay, cost heatmap, per-concept stats."""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+
 import argparse, glob, json, os, time
 
 import numpy as np

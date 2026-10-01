@@ -1,4 +1,7 @@
 """How sensitive is SAM 3 to prompt phrasing? Prints max score + mask area per variant."""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+
 import argparse, glob
 
 from PIL import Image
