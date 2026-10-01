@@ -8,3 +8,5 @@ git clone https://github.com/facebookresearch/sam3.git third_party/sam3
 pip install -e third_party/sam3
 # sam3 pins numpy<2; constrain it so opencv does not pull numpy 2.x
 pip install "numpy<2" opencv-python-headless pillow matplotlib
+# imported by sam3 but not declared in its pyproject
+pip install einops pycocotools psutil scipy
